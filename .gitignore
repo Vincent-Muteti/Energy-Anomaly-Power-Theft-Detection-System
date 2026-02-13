@@ -1,0 +1,8 @@
+# Ignore large raw datasets
+power_raw_cleaned.csv
+
+# General ignores
+__pycache__/
+.ipynb_checkpoints/
+*.parquet
+.env
