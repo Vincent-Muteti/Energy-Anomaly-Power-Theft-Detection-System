@@ -1,4 +1,8 @@
 import json
+import os
+import shutil
+from datetime import datetime
+
 import joblib
 import numpy as np
 import pandas as pd
@@ -17,6 +21,11 @@ ARTIFACT_DIR = "artifacts"
 MODELS_PATH = f"{ARTIFACT_DIR}/models_by_meter.joblib"
 SCALERS_PATH = f"{ARTIFACT_DIR}/scalers_by_meter.joblib"
 META_PATH = f"{ARTIFACT_DIR}/metadata.json"
+
+OUTPUT_DIR = "outputs"
+SCORED_PATH = f"{OUTPUT_DIR}/scored_output.csv"
+REPORT_PATH = f"{OUTPUT_DIR}/inspection_report.csv"
+META_OUT_PATH = f"{OUTPUT_DIR}/run_metadata.json"
 
 
 def generate_alert(row: pd.Series) -> str:
@@ -64,20 +73,17 @@ def load_artifacts():
     return meta, models_by_meter, scalers_by_meter
 
 
-def load_data(power_df: pd.DataFrame, weather_df: pd.DataFrame, start_date: str, end_date: str):
-    power_df = power_df.copy()
-    weather_df = weather_df.copy()
+def load_data(power_df, weather_df, start_date, end_date):
     power_df["date"] = pd.to_datetime(power_df["date"])
     weather_df["date"] = pd.to_datetime(weather_df["date"])
 
     df = power_df.merge(weather_df, on="date", how="left")
     df = df[(df["date"] >= start_date) & (df["date"] <= end_date)].copy()
-    df = df.dropna().copy()
-    df = df.sort_values(["meter_id", "date"]).copy()
+    df = df.dropna().sort_values(["meter_id", "date"])
     return df
 
 
-def add_features(df: pd.DataFrame, rolling_window_days: int):
+def add_features(df, rolling_window_days):
     w = int(rolling_window_days)
     df = df.sort_values(["meter_id", "date"]).copy()
 
@@ -92,8 +98,7 @@ def add_features(df: pd.DataFrame, rolling_window_days: int):
     return df
 
 
-def score(df: pd.DataFrame, features: list[str], models_by_meter: dict, scalers_by_meter: dict):
-    df = df.copy()
+def score(df, features, models_by_meter, scalers_by_meter):
     df["anomaly_score"] = np.nan
 
     for meter_id, g in df.groupby("meter_id"):
@@ -102,14 +107,12 @@ def score(df: pd.DataFrame, features: list[str], models_by_meter: dict, scalers_
             continue
         X = g[features].fillna(0)
         Xs = scalers_by_meter[key].transform(X)
-        scores = models_by_meter[key].decision_function(Xs)
-        df.loc[g.index, "anomaly_score"] = scores
+        df.loc[g.index, "anomaly_score"] = models_by_meter[key].decision_function(Xs)
 
     return df
 
 
-def make_report(df: pd.DataFrame, threshold: float):
-    df = df.copy()
+def make_report(df, threshold):
     df["anomaly_flag_global"] = (df["anomaly_score"] <= threshold).astype(int)
 
     max_streak = compute_max_streak(df, "anomaly_flag_global")
@@ -119,7 +122,7 @@ def make_report(df: pd.DataFrame, threshold: float):
         percent_anomalous=("anomaly_flag_global", "mean"),
         worst_anomaly_score=("anomaly_score", "min"),
         avg_anomaly_score=("anomaly_score", "mean"),
-        last_anomaly_date=("date", lambda x: x[df.loc[x.index, "anomaly_flag_global"].eq(1)].max())
+        last_anomaly_date=("date", lambda x: x[df.loc[x.index, "anomaly_flag_global"].eq(1)].max()),
     ).reset_index()
 
     report = report.merge(max_streak, on="meter_id", how="left")
@@ -133,74 +136,83 @@ def make_report(df: pd.DataFrame, threshold: float):
     report["risk_level"] = pd.cut(
         report["risk_score"],
         bins=[-1, 33, 66, 101],
-        labels=["Low", "Medium", "High"]
+        labels=["Low", "Medium", "High"],
     )
-    report["risk_level"] = pd.Categorical(report["risk_level"], categories=["High", "Medium", "Low"], ordered=True)
-    report = report.sort_values(by=["risk_level", "risk_score"], ascending=[True, False]).reset_index(drop=True)
 
     report["alert_message"] = report.apply(generate_alert, axis=1)
     return report
 
 
-# -----------------------
-# App flow
-# -----------------------
-try:
-    meta, models_by_meter, scalers_by_meter = load_artifacts()
-except Exception as e:
-    st.error("Artifacts not found. Run `python train.py` first to create artifacts/.")
-    st.exception(e)
-    st.stop()
+# --------------------
+# App Flow
+# --------------------
 
-st.sidebar.subheader("Loaded model artifacts")
-st.sidebar.write(f"Trained at: {meta['trained_at']}")
-st.sidebar.write(f"Time window: {meta['start_date']} to {meta['end_date']}")
-st.sidebar.write(f"Global threshold: {meta['global_threshold']:.6f}")
+meta, models_by_meter, scalers_by_meter = load_artifacts()
 
 run_btn = st.sidebar.button("Run Scoring")
 
 if DATA_MODE == "Upload CSVs":
-    power_file = st.sidebar.file_uploader("Upload power_multi_household_daily.csv", type=["csv"])
-    weather_file = st.sidebar.file_uploader("Upload nairobi_weather_2007_2008.csv", type=["csv"])
+    power_file = st.sidebar.file_uploader("Upload power CSV", type=["csv"])
+    weather_file = st.sidebar.file_uploader("Upload weather CSV", type=["csv"])
 else:
     power_file = None
     weather_file = None
 
+
+tab0, tab1, tab2, tab3 = st.tabs(["How to Use", "Inspection Report", "Alerts", "Export"])
+
+with tab0:
+    st.subheader("How to use this app")
+
+    st.markdown("""
+1. Choose **Data mode** in the sidebar:
+   - **Use repo data** (demo mode), or
+   - **Upload CSVs** (your own datasets).
+2. Click **Run Scoring** to compute anomaly scores.
+3. View prioritized meters in the Inspection Report tab.
+4. Download the final inspection CSV from the Export tab.
+""")
+
+    st.warning("""
+Upload Mode Requirements:
+- Power CSV must contain:
+  meter_id, date, daily_mean_power
+- Weather CSV must contain:
+  date and required weather columns used in training
+- Column names must match exactly.
+""")
+
 if run_btn:
-    with st.spinner("Scoring data..."):
-        if DATA_MODE == "Upload CSVs":
-            if power_file is None or weather_file is None:
-                st.error("Please upload BOTH CSV files.")
-                st.stop()
-            power_df = pd.read_csv(power_file)
-            weather_df = pd.read_csv(weather_file)
-        else:
-            power_df = pd.read_csv(POWER_PATH)
-            weather_df = pd.read_csv(WEATHER_PATH)
+    if DATA_MODE == "Upload CSVs":
+        if power_file is None or weather_file is None:
+            st.error("Upload both CSV files.")
+            st.stop()
+        power_df = pd.read_csv(power_file)
+        weather_df = pd.read_csv(weather_file)
+    else:
+        power_df = pd.read_csv(POWER_PATH)
+        weather_df = pd.read_csv(WEATHER_PATH)
 
-        df = load_data(power_df, weather_df, meta["start_date"], meta["end_date"])
-        df = add_features(df, meta["rolling_window_days"])
-        df = score(df, meta["features"], models_by_meter, scalers_by_meter)
+    df = load_data(power_df, weather_df, meta["start_date"], meta["end_date"])
+    df = add_features(df, meta["rolling_window_days"])
+    df = score(df, meta["features"], models_by_meter, scalers_by_meter)
 
-        report = make_report(df, meta["global_threshold"])
+    report = make_report(df, meta["global_threshold"])
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Rows scored", f"{len(df):,}")
-        c2.metric("Flagged anomalies", f"{int((df['anomaly_score'] <= meta['global_threshold']).sum()):,}")
-        c3.metric("Meters", f"{report.shape[0]}")
-
-        st.subheader("Inspection Report")
+    with tab1:
         st.dataframe(report, use_container_width=True)
 
-        st.subheader("Alerts (High/Medium)")
-        st.dataframe(report[["meter_id", "risk_level", "risk_score", "alert_message"]], use_container_width=True)
+    with tab2:
+        st.dataframe(
+            report[["meter_id", "risk_level", "risk_score", "alert_message"]],
+            use_container_width=True,
+        )
 
+    with tab3:
         csv_bytes = report.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "Download Inspection Report CSV",
-            data=csv_bytes,
-            file_name="KPLC_Inspection_Report_2007_2008.csv",
-            mime="text/csv"
+            "Download Inspection Report",
+            csv_bytes,
+            file_name="Inspection_Report.csv",
+            mime="text/csv",
         )
-else:
-    st.info("Click 'Run Scoring' in the sidebar. If artifacts are missing, run `python train.py` first.")
